@@ -4,15 +4,16 @@ embedding_engine.py
 AI Embedding Engine for the EDXSO School Influencer Discovery Tool.
 Generates dense vector embeddings using Sentence Transformers (all-MiniLM-L6-v2)
 and computes semantic cosine similarity across candidate biographies.
-Includes in-memory embedding caching and a graceful TF-IDF fallback.
+Includes in-memory embedding caching, latency logging, and a graceful TF-IDF fallback.
 """
 
 import hashlib
-import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
+from logger_config import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger("embedding_engine")
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 _MODEL = None
@@ -24,13 +25,15 @@ def get_model():
     """Lazy-load and cache the SentenceTransformer model instance."""
     global _MODEL, _FALLBACK_MODE
     if _MODEL is None and not _FALLBACK_MODE:
+        start_time = time.time()
         try:
             from sentence_transformers import SentenceTransformer
             _MODEL = SentenceTransformer(MODEL_NAME)
-            logger.info("Loaded SentenceTransformer model: %s", MODEL_NAME)
+            load_time = round((time.time() - start_time) * 1000, 2)
+            logger.info("Loaded SentenceTransformer model '%s' in %.2f ms", MODEL_NAME, load_time)
         except Exception as exc:
             logger.warning(
-                "Could not initialize SentenceTransformer (%s). Activating TF-IDF semantic fallback: %s",
+                "Could not initialize SentenceTransformer (%s). Activating TF-IDF fallback: %s",
                 MODEL_NAME,
                 exc,
             )
@@ -85,17 +88,19 @@ def generate_embeddings(texts: List[str]) -> np.ndarray:
     Generate normalized dense vector embeddings for a list of text strings.
     Utilizes in-memory caching for previously encoded strings.
     """
+    start_time = time.time()
     model = get_model()
 
-    # Check which texts need encoding
     needed_indices = []
     needed_texts = []
     embeddings_list: List[Optional[np.ndarray]] = [None] * len(texts)
+    cache_hits = 0
 
     for i, t in enumerate(texts):
         h = _hash_text(t)
         if h in _CACHE:
             embeddings_list[i] = _CACHE[h]
+            cache_hits += 1
         else:
             needed_indices.append(i)
             needed_texts.append(t)
@@ -120,6 +125,15 @@ def generate_embeddings(texts: List[str]) -> np.ndarray:
             for idx, text, vec in zip(needed_indices, needed_texts, fallback_vecs):
                 _CACHE[_hash_text(text)] = vec
                 embeddings_list[idx] = vec
+
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+    logger.debug(
+        "Embeddings: %d total, %d cache hits, %d newly encoded in %.2f ms",
+        len(texts),
+        cache_hits,
+        len(needed_texts),
+        elapsed_ms,
+    )
 
     return np.array(embeddings_list)
 
@@ -146,10 +160,21 @@ def calculate_similarity(reference_text: str, candidate_texts: List[str]) -> np.
     if not candidate_texts:
         return np.array([], dtype=float)
 
+    start_time = time.time()
     ref_vec = generate_embeddings([reference_text])[0]
     cand_vecs = generate_embeddings(candidate_texts)
 
-    # Dot product of normalized vectors equals cosine similarity
     similarities = np.dot(cand_vecs, ref_vec)
-    # Clip between 0.0 and 1.0 for stability
-    return np.clip(similarities, 0.0, 1.0)
+    clipped = np.clip(similarities, 0.0, 1.0)
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+
+    logger.info(
+        "Semantic similarity computed for %d candidates in %.2f ms (min=%.3f, mean=%.3f, max=%.3f)",
+        len(candidate_texts),
+        elapsed_ms,
+        float(clipped.min()) if len(clipped) else 0.0,
+        float(clipped.mean()) if len(clipped) else 0.0,
+        float(clipped.max()) if len(clipped) else 0.0,
+    )
+
+    return clipped

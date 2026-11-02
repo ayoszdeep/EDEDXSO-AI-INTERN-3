@@ -3,13 +3,16 @@ profile_analyzer.py
 ===================
 AI and NLP-based profile analysis engine.
 Extracts structured indicators, role families, leadership evidence,
-and school ecosystem tags from unstructured reference profile inputs.
+curriculum affiliations, and school ecosystem tags from unstructured reference profile inputs.
 """
 
 import json
 import re
+import time
 from typing import Any, Dict, List, Optional, Set
+from logger_config import setup_logger
 
+logger = setup_logger("profile_analyzer")
 
 ROLE_FAMILY_PATTERNS = {
     "Education Consulting": [
@@ -137,6 +140,23 @@ TAG_PATTERNS = {
     ],
 }
 
+CURRICULUM_BOARDS = {
+    "CBSE": [r"\bcbse\b", r"\bcentral board\b"],
+    "CISCE / ICSE": [r"\bcisce\b", r"\bicse\b", r"\bisc\b"],
+    "IB": [r"\binternational baccalaureate\b", r"\bib\b", r"\bpyp\b", r"\bmyp\b", r"\bibdp\b"],
+    "Cambridge": [r"\bcambridge\b", r"\bigcse\b", r"\ba-levels\b"],
+}
+
+
+def extract_curriculum_boards(text: str) -> List[str]:
+    """Detect documented curriculum boards from text."""
+    text_lower = text.lower()
+    boards = []
+    for board, patterns in CURRICULUM_BOARDS.items():
+        if any(re.search(p, text_lower) for p in patterns):
+            boards.append(board)
+    return boards
+
 
 def extract_experience_years(text: str, explicit_years: Optional[Any] = None) -> Optional[int]:
     """Extract years of experience from explicit value or regex text analysis."""
@@ -146,7 +166,6 @@ def extract_experience_years(text: str, explicit_years: Optional[Any] = None) ->
         except (ValueError, TypeError):
             pass
 
-    # Pattern: "18 years of experience", "20+ yrs", "15 years in education"
     match = re.search(
         r"(\d{1,2})\+?\s*(?:years?|yrs?)(?:\s*(?:of)?\s*(?:experience|in education|in school|in k-12))?",
         text,
@@ -164,13 +183,11 @@ def extract_role_family(current_role: str, biography: str) -> str:
     """Determine the primary role family based on current role and background."""
     role_lower = current_role.lower()
 
-    # Prioritize current role first
     for family, patterns in ROLE_FAMILY_PATTERNS.items():
         for pat in patterns:
             if re.search(pat, role_lower):
                 return family
 
-    # Fallback to biography inspection
     bio_lower = biography.lower()
     for family, patterns in ROLE_FAMILY_PATTERNS.items():
         for pat in patterns:
@@ -221,15 +238,8 @@ def extract_tags(text: str) -> List[str]:
 def analyze_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     """
     Perform comprehensive AI/rule-based analysis of a reference profile.
-
-    Parameters:
-        profile: Dictionary containing:
-            name, current_role, organisation, location, biography,
-            past_roles, school_experience, etc.
-
-    Returns:
-        Structured analysis dictionary.
     """
+    start_time = time.time()
     name = str(profile.get("name", "")).strip()
     current_role = str(profile.get("current_role", "")).strip()
     organisation = str(profile.get("organisation", "")).strip()
@@ -244,6 +254,7 @@ def analyze_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     role_family = extract_role_family(current_role, biography)
     exp_years = extract_experience_years(combined_text, profile.get("experience_years"))
     previous_roles = extract_previous_roles(past_roles, biography)
+    curricula = extract_curriculum_boards(combined_text)
 
     # Extract tags
     manual_tags = profile.get("professional_tags", "")
@@ -288,6 +299,28 @@ def analyze_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
     if entrepreneur_evidence:
         skills.append("Educational Entrepreneurship")
 
+    # Data completeness index (fraction of verified key attributes)
+    signals = [
+        bool(name),
+        bool(current_role),
+        bool(organisation),
+        bool(location),
+        exp_years is not None,
+        len(previous_roles) > 0,
+        len(all_tags) >= 3,
+        leadership_evidence or consulting_evidence,
+    ]
+    completeness_score = round(sum(signals) / len(signals) * 100.0, 1)
+
+    latency_ms = round((time.time() - start_time) * 1000, 2)
+    logger.info(
+        "Analyzed profile for '%s' in %.2f ms. Role Family: %s, Completeness: %.1f%%",
+        name or "Anonymous",
+        latency_ms,
+        role_family,
+        completeness_score,
+    )
+
     return {
         "name": name,
         "current_role": current_role,
@@ -297,6 +330,7 @@ def analyze_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
         "industry": "School Education (K-12)",
         "experience_years": exp_years,
         "previous_roles": previous_roles,
+        "curricula": curricula,
         "skills": skills,
         "school_ecosystem_tags": all_tags,
         "leadership_evidence": leadership_evidence,
@@ -304,6 +338,8 @@ def analyze_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
         "consulting_evidence": consulting_evidence,
         "entrepreneur_evidence": entrepreneur_evidence,
         "decision_maker_evidence": decision_maker_evidence,
+        "completeness_score": completeness_score,
+        "latency_ms": latency_ms,
         "analysis_summary": (
             f"{name} is an identified {role_family} with approx {exp_years or '10+'} years of K-12 background. "
             f"Evidence shows: Leadership ({'Yes' if leadership_evidence else 'No'}), "

@@ -3,26 +3,33 @@ ranker.py
 =========
 Intelligent hybrid ranking engine for the EDXSO School Influencer Discovery Tool.
 Combines:
-  1. AI Semantic Similarity (45%)
-  2. School Ecosystem Relevance (20%)
-  3. Role & Experience Similarity (15%)
-  4. Multi-School Network Exposure (15%)
-  5. Location Relevance (5%)
-With graceful missing-data renormalization and strict exclusion of the reference candidate.
+  1. AI Semantic Similarity (45% default)
+  2. School Ecosystem Relevance (20% default)
+  3. Role & Experience Similarity (15% default)
+  4. Multi-School Network Exposure (15% default)
+  5. Location Relevance (5% default)
+Supports dynamic weight tuning, graceful missing-data renormalization,
+candidate data completeness scoring, and strict reference exclusion.
 """
 
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
+from logger_config import setup_logger
 
-WEIGHTS = {
+logger = setup_logger("ranker")
+
+DEFAULT_WEIGHTS = {
     "semantic": 0.45,
     "school": 0.20,
     "role": 0.15,
     "network": 0.15,
     "location": 0.05,
 }
+
+WEIGHTS = DEFAULT_WEIGHTS.copy()
 
 METRO_CLUSTERS = {
     "delhi ncr": {"delhi", "new delhi", "noida", "greater noida", "gurgaon", "gurugram", "faridabad", "ghaziabad"},
@@ -112,22 +119,18 @@ def calculate_network_score(
 
     # Explicit multi-school boolean
     if multi_bool is True:
-        # Check scale if mentioned (e.g. 10+ schools, group, network)
         if re.search(r"\b(\d{1,2}\+?\s*schools|network of|group of schools|multiple campuses|chain)\b", combined):
             return 1.0
         return 0.9
 
     if multi_bool is False:
-        # Check if single school leadership with high reach
         if re.search(r"\b(principal|headmaster)\b", combined):
             return 0.5
         return 0.2
 
-    # Check if text holds evidence even if boolean wasn't strictly parsed
     if re.search(r"\b(multiple schools|school network|several schools|cluster|pan-india)\b", combined):
         return 0.85
 
-    # If completely unknown, return None so weights are gracefully renormalized
     return None
 
 
@@ -153,17 +156,14 @@ def calculate_location_score(ref_location: str, cand_location: str) -> Optional[
     if not r_clean or not c_clean:
         return None
 
-    # Exact or substring match
     if r_clean == c_clean or r_clean in c_clean or c_clean in r_clean:
         return 1.0
 
-    # Metro cluster match
     ref_metro = _get_metro(r_clean)
     cand_metro = _get_metro(c_clean)
     if ref_metro and cand_metro and ref_metro == cand_metro:
         return 1.0
 
-    # Same country check (India default context)
     is_ref_india = any(w in r_clean for w in ["india", "delhi", "mumbai", "bengaluru", "bangalore", "hyderabad", "pune", "kolkata", "chennai", "noida", "gurgaon"])
     is_cand_india = any(w in c_clean for w in ["india", "delhi", "mumbai", "bengaluru", "bangalore", "hyderabad", "pune", "kolkata", "chennai", "noida", "gurgaon"])
 
@@ -173,17 +173,18 @@ def calculate_location_score(ref_location: str, cand_location: str) -> Optional[
     return 0.2
 
 
-def calculate_final_score(components: Dict[str, Optional[float]]) -> Tuple[float, Dict[str, float]]:
+def calculate_final_score(
+    components: Dict[str, Optional[float]],
+    weights_dict: Optional[Dict[str, float]] = None,
+) -> Tuple[float, Dict[str, float]]:
     """
     Compute total normalized score (0-100) using available components and renormalization.
-
-    Returns:
-        (total_score, component_contributions)
     """
+    active_weights = weights_dict or WEIGHTS
     available = [
-        (key, WEIGHTS[key], val)
+        (key, active_weights[key], val)
         for key, val in components.items()
-        if key in WEIGHTS and val is not None
+        if key in active_weights and val is not None
     ]
 
     if not available:
@@ -206,24 +207,34 @@ def calculate_final_score(components: Dict[str, Optional[float]]) -> Tuple[float
     return total_score, contributions
 
 
+def compute_candidate_completeness(cand: Dict[str, Any]) -> float:
+    """Compute data verification completeness percentage for a candidate."""
+    checks = [
+        bool(cand.get("name")),
+        bool(cand.get("current_role")),
+        bool(cand.get("organisation")),
+        bool(cand.get("location")),
+        bool(cand.get("biography")),
+        cand.get("experience_years") is not None and not pd.isna(cand.get("experience_years")),
+        cand.get("multi_school_bool") is not None,
+        cand.get("decision_maker_bool") is not None,
+        bool(cand.get("source_url")),
+        bool(cand.get("source_date")),
+    ]
+    return round((sum(checks) / len(checks)) * 100.0, 1)
+
+
 def rank_candidates(
     reference_analysis: Dict[str, Any],
     candidates: List[Dict[str, Any]],
     semantic_scores: np.ndarray,
     min_score: float = 0.0,
+    custom_weights: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Score and rank candidate profiles against reference profile analysis.
-
-    Parameters:
-        reference_analysis: Output of profile_analyzer.analyze_profile()
-        candidates: List of candidate profile dictionaries
-        semantic_scores: Array of precomputed semantic similarities matching candidates
-        min_score: Filter threshold (0.0 to 100.0)
-
-    Returns:
-        Sorted list of candidate dictionaries with added score breakdowns.
     """
+    start_time = time.time()
     ref_name = str(reference_analysis.get("name", "")).strip().lower()
     ref_li = str(reference_analysis.get("linkedin_url", "")).strip().lower()
     ref_tags = reference_analysis.get("school_ecosystem_tags", [])
@@ -231,22 +242,28 @@ def rank_candidates(
     ref_exp = reference_analysis.get("experience_years")
     ref_loc = reference_analysis.get("location", "")
 
+    effective_weights = custom_weights or WEIGHTS
     ranked_results = []
+    excluded_count = 0
+    renormalized_count = 0
 
     for idx, cand in enumerate(candidates):
         cand_name = str(cand.get("name", "")).strip().lower()
         cand_li = str(cand.get("linkedin_url", "")).strip().lower()
 
-        # Strict exclusion of the reference person themselves
+        # Strict exclusion of reference professional
         if ref_name and cand_name and (ref_name == cand_name):
+            excluded_count += 1
+            logger.info("Excluded reference person '%s' from discovery results", cand.get("name"))
             continue
         if ref_li and cand_li and (ref_li == cand_li):
+            excluded_count += 1
+            logger.info("Excluded reference person by LinkedIn URL from discovery results")
             continue
 
         sem_score = float(semantic_scores[idx]) if idx < len(semantic_scores) else 0.0
         school_score = tag_similarity(ref_tags, cand.get("parsed_tags", []))
 
-        # Determine candidate role family
         cand_family = cand.get("role_family")
         if not cand_family:
             from profile_analyzer import extract_role_family
@@ -273,10 +290,16 @@ def rank_candidates(
             "location": location_score,
         }
 
-        total_score, contributions = calculate_final_score(components)
+        # Track renormalization
+        if network_score is None or location_score is None:
+            renormalized_count += 1
+
+        total_score, contributions = calculate_final_score(components, effective_weights)
 
         if total_score < min_score:
             continue
+
+        completeness = compute_candidate_completeness(cand)
 
         result_item = dict(cand)
         result_item.update({
@@ -289,9 +312,21 @@ def rank_candidates(
             "raw_location": round(location_score, 3) if location_score is not None else None,
             "contributions": contributions,
             "components": components,
+            "data_completeness": completeness,
+            "confidence_tier": "High Confidence" if completeness >= 80 else "Moderate Confidence",
         })
         ranked_results.append(result_item)
 
-    # Sort descending by total_score
     ranked_results.sort(key=lambda x: x["total_score"], reverse=True)
+    elapsed_ms = round((time.time() - start_time) * 1000, 2)
+
+    logger.info(
+        "Ranked %d candidates in %.2f ms. Top score: %.1f, Excluded: %d, Renormalized: %d",
+        len(ranked_results),
+        elapsed_ms,
+        ranked_results[0]["total_score"] if ranked_results else 0.0,
+        excluded_count,
+        renormalized_count,
+    )
+
     return ranked_results

@@ -44,3 +44,7 @@ Thumbs.db
 
 # Environment Variables
 .env
+
+*.log
+data/*.log
+
